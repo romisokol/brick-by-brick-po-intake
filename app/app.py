@@ -94,7 +94,16 @@ elif page == 'Review queue':
     st.caption('Open Order review in the sidebar to inspect an order. Nothing in this screen changes source data.')
 
 else:
-    labels = [f'{r.source_doc_id} · {r.po_number or "Missing PO"} · order {r.source_order_index} · {r.status}' for r in orders.itertuples()]
+    labels = []
+    for r in orders.itertuples():
+        parts = [str(r.source_doc_id), str(r.po_number) if pd.notna(r.po_number) and str(r.po_number).strip() else 'Missing PO']
+        if pd.notna(r.source_order_index):
+            order_index = r.source_order_index
+            if isinstance(order_index, float) and order_index.is_integer():
+                order_index = int(order_index)
+            parts.append(f'order {order_index}')
+        parts.append(str(r.status))
+        labels.append(' · '.join(parts))
     index = st.selectbox('Choose an order', range(len(orders)), format_func=lambda i: labels[i])
     order = orders.iloc[index]
     selected = select_order(lines, order)
@@ -134,17 +143,16 @@ else:
             st.code(str(exc))
     with right:
         st.subheader('Proposed order')
-        a,b,c = st.columns(3)
-        a.metric('Status',order.status)
-        b.metric('Lowest confidence','Unknown' if pd.isna(order.confidence) else f'{order.confidence:.0%}')
+        st.markdown(f'**Status: {order.status}**')
+        b,c = st.columns(2)
+        b.metric('Confidence','Unknown' if pd.isna(order.confidence) else f'{order.confidence:.0%}')
         c.metric('Lines',int(order.lines))
         first = selected.iloc[0]
         st.write('**Customer:**', str(first.get('master_customer_name') or first.get('sold_to_name_raw')))
         st.write('**Ship-to:**', str(first.get('master_ship_to_name') or first.get('ship_to_name_raw')))
-        reasons = sorted(set(selected.review_reasons.dropna()))
-        for reason in reasons:
-            if reason:
-                st.warning(reason)
+        reasons = sorted({reason.strip() for value in selected.review_reasons.dropna() for reason in str(value).split(';') if reason.strip()})
+        if reasons:
+            st.warning('**Issues requiring review**\n\n' + '\n'.join(f'- {reason}' for reason in reasons))
         visible = ['line_number','item_code','item_description','material_id','quantity_as_written','uom_as_written','quantity_each','expected_net_price','currency','proposed_atp_outcome','proposed_ship_quantity','overall_confidence','source_pointer']
         visible = [x for x in visible if x in selected]
         st.dataframe(selected[visible],hide_index=True,use_container_width=True)
