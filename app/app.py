@@ -1,4 +1,8 @@
-import base64
+import io
+import json
+from email import policy
+from email.parser import BytesParser
+import pypdfium2 as pdfium
 import pandas as pd
 import streamlit as st
 import altair as alt
@@ -47,24 +51,101 @@ def status_row_style(row):
               'READY': 'background-color: #EAF5EF; color: #285D43;'}
     return [styles.get(status, '')] * len(row)
 
+def readable(value, fallback='Not available'):
+    if value is None or pd.isna(value) or not str(value).strip():
+        return fallback
+    return str(value)
+
+
+def render_source(data, extension, key):
+    extension = extension.lstrip('.')
+    if extension in ['png', 'jpg', 'jpeg']:
+        st.image(data, use_container_width=True)
+    elif extension == 'pdf':
+        try:
+            document = pdfium.PdfDocument(data)
+            try:
+                page_index = st.selectbox('Page', range(len(document)),
+                    format_func=lambda i: f'Page {i + 1} of {len(document)}', key=f'pdf_{key}')
+                page = document[page_index]
+                try:
+                    bitmap = page.render(scale=min(1.7, 1600 / max(page.get_size())))
+                    try:
+                        image = bitmap.to_pil()
+                        output = io.BytesIO()
+                        image.save(output, format='PNG')
+                        st.image(output.getvalue(), use_container_width=True)
+                    finally:
+                        bitmap.close()
+                finally:
+                    page.close()
+            finally:
+                document.close()
+        except Exception:
+            st.warning('This document could not be previewed. Download the original below to view it.')
+    else:
+        text = data.decode('utf-8', errors='replace')
+        if extension == 'json':
+            try:
+                payload = json.loads(text)
+            except ValueError:
+                payload = None
+            if isinstance(payload, dict) and isinstance(payload.get('segments'), list):
+                st.caption('Call transcript · Original wording')
+                for segment in payload['segments']:
+                    if not isinstance(segment, dict):
+                        continue
+                    speaker = str(segment.get('speaker', 'Speaker')).replace('_', ' ').title()
+                    start = segment.get('start')
+                    timestamp = ''
+                    if isinstance(start, (int, float)) and start >= 0:
+                        timestamp = f' · {int(start)//60:02d}:{int(start)%60:02d}'
+                    with st.container(border=True):
+                        st.caption(speaker + timestamp)
+                        st.text(str(segment.get('text', '')))
+                with st.expander('Transcript metadata and original JSON'):
+                    st.json(payload)
+            elif payload is not None:
+                st.caption('Structured source document')
+                st.json(payload, expanded=2)
+            else:
+                st.text(text[:150000])
+        elif extension == 'csv':
+            try:
+                st.dataframe(pd.read_csv(io.StringIO(text), sep=None, engine='python', nrows=1000),
+                    hide_index=True, use_container_width=True)
+                st.caption('Preview shows up to 1,000 source rows.')
+            except Exception:
+                st.text(text[:150000])
+        elif extension == 'eml':
+            message = BytesParser(policy=policy.default).parsebytes(data)
+            for label in ['From', 'To', 'Subject', 'Date']:
+                st.text(f'{label}: {message.get(label, "Not available")}')
+            body = message.get_body(preferencelist=('plain',))
+            if body:
+                st.text(str(body.get_content())[:150000])
+            else:
+                st.info('Download the email to inspect its formatted body and attachments.')
+        elif extension in ['txt', 'edi']:
+            st.caption('Original transcript' if extension == 'txt' else 'Original EDI document')
+            st.text(text[:150000])
+        else:
+            st.info('Download the original file to view this format.')
+
+
 COLORS = {'READY':'#5B9476', 'REVIEW':'#C49A45', 'FAILED':'#BE6670'}
 st.sidebar.title('MAISON SOLENNE')
 st.sidebar.caption('ORDER OPERATIONS')
 if st.sidebar.button('← Welcome', key='return_to_welcome'):
     st.session_state.workspace_entered = False
     st.rerun()
-page = st.sidebar.radio('Workspace', ['Overview', 'Review queue', 'Order review', 'Deployment notes'])
-st.sidebar.caption('Read-only first release · synthetic data')
-if st.sidebar.button('Refresh from Gold'):
+page = st.sidebar.radio('Workspace', ['Overview', 'Review queue', 'Order review'])
+st.sidebar.caption('Live Databricks data · View only')
+if st.sidebar.button('Refresh data'):
     st.session_state.pop('gold_lines', None)
     st.rerun()
 
 st.title(page)
-if page == 'Deployment notes':
-    st.info('This release reads Gold and source documents. Persistent editing, approvals, audit, and ERP export are not enabled yet.')
-    st.markdown('Use the app README for deployment and permissions. Do not grant MODIFY on Gold or pipeline tables. Region-specific access controls must be configured before sharing beyond the team.')
-    st.stop()
-
 try:
     if 'gold_lines' not in st.session_state:
         with st.spinner('Loading proposed orders…'):
@@ -90,13 +171,13 @@ if lines.empty:
     st.info('No lines match these filters.')
     st.stop()
 orders = orders_from_lines(lines)
-st.caption('Proposed sales orders · quantities in eaches · values kept in their original currencies')
+st.caption('Proposed sales orders · quantities in individual units · values in original currencies')
 
 if page == 'Overview':
     cols = st.columns(4)
     cols[0].metric('Proposed orders', f'{len(orders):,}')
     cols[1].metric('Order lines', f'{len(lines):,}')
-    cols[2].metric('Orders requiring attention', f'{orders.status.ne("READY").sum():,}')
+    cols[2].metric('Needs attention', f'{orders.status.ne("READY").sum():,}')
     cols[3].metric('Ready order share', f'{orders.status.eq("READY").mean():.1%}')
     st.caption('Ready share is a routing metric, not measured straight-through processing or accuracy.')
     left, right = st.columns(2)
@@ -107,21 +188,20 @@ if page == 'Overview':
     with right:
         st.subheader('Lines by channel')
         counts = lines.groupby('channel').size().reset_index(name='lines')
-        st.altair_chart(alt.Chart(counts).mark_bar(color='#527FA3').encode(x='lines:Q',y=alt.Y('channel:N',sort='-x'),tooltip=['channel','lines']).properties(height=300), use_container_width=True)
+        st.altair_chart(alt.Chart(counts).mark_bar(color='#527FA3').encode(x='lines:Q',y=alt.Y('channel:N',sort='-x', title=None, axis=alt.Axis(labelLimit=220)),tooltip=['channel','lines']).properties(height=300), use_container_width=True)
     left, right = st.columns(2)
     with left:
         st.subheader('Reasons for review')
         reasons = lines.loc[lines.needs_review.fillna(True), 'review_reasons'].dropna().str.split('; ').explode()
         counts = reasons[reasons.ne('')].value_counts().head(8).rename_axis('reason').reset_index(name='lines')
-        st.altair_chart(alt.Chart(counts).mark_bar(color='#527FA3').encode(x='lines:Q', y=alt.Y('reason:N',sort='-x')).properties(height=300),use_container_width=True)
+        st.altair_chart(alt.Chart(counts).mark_bar(color='#527FA3').encode(x='lines:Q', y=alt.Y('reason:N',sort='-x', title=None, axis=alt.Axis(labelLimit=280)), tooltip=['reason','lines']).properties(height=300),use_container_width=True)
     with right:
         st.subheader('Inventory proposals')
         counts = lines.groupby('proposed_atp_outcome').size().reset_index(name='lines')
-        st.altair_chart(alt.Chart(counts).mark_bar(color='#527FA3').encode(x='proposed_atp_outcome:N', y='lines:Q',tooltip=['proposed_atp_outcome','lines']).properties(height=300),use_container_width=True)
-    st.info('Extraction gaps remain upstream. Order readiness does not prove completeness; evaluate accuracy separately against ground truth.')
+        st.altair_chart(alt.Chart(counts).mark_bar(color='#527FA3').encode(x=alt.X('proposed_atp_outcome:N', title='Availability proposal', axis=alt.Axis(labelAngle=0)), y='lines:Q',tooltip=['proposed_atp_outcome','lines']).properties(height=300),use_container_width=True)
 
 elif page == 'Review queue':
-    st.write('Unknown or lowest confidence first; then currency and highest known value. Partial values are labeled by priced-line coverage.')
+    st.caption('Prioritized by missing or low confidence, then by currency and known order value.')
     statuses = st.multiselect('Order status', ['FAILED','REVIEW','READY'], default=['FAILED','REVIEW'])
     queue = orders[orders.status.isin(statuses)].copy()
     search = st.text_input('Search PO, document, or customer')
@@ -162,22 +242,15 @@ else:
                 else:
                     file_index = st.selectbox('Original file', range(len(files)), format_func=lambda i: str(files.iloc[i].file_name), key=f'file_{tab_key}_{index}')
                     source = files.iloc[file_index]
-                    st.caption(str(source.file_path))
+                    with st.expander('Source location'):
+                        st.caption(str(source.file_path))
                     content = source.content
                     if content is None:
                         st.warning('Source exceeds the 16 MB preview limit. Use governed storage to inspect it.')
                     else:
                         data = bytes(content)
                         extension = str(source.file_extension).lower()
-                        if extension in ['png','jpg','jpeg']:
-                            st.image(data, use_container_width=True)
-                        elif extension == 'pdf':
-                            encoded = base64.b64encode(data).decode()
-                            st.components.v1.html(f'<iframe title="Original PDF" src="data:application/pdf;base64,{encoded}" width="100%" height="650"></iframe>',height=665)
-                        elif extension in ['txt','json','csv','edi','eml']:
-                            st.code(data.decode('utf-8',errors='replace')[:150000], language=None)
-                        else:
-                            st.info('Preview unavailable for this format. Download the original to inspect it.')
+                        render_source(data, extension, f'{tab_key}_{index}_{file_index}')
                         st.download_button('Download original',data,file_name=str(source.file_name), key=f'download_{tab_key}_{index}')
                         if '-ATT-' in str(order.source_doc_id):
                             st.caption('This is the parent source. For an email attachment, download the email to inspect its attached document.')
@@ -196,26 +269,35 @@ else:
             b.metric('Confidence','Unknown' if pd.isna(order.confidence) else f'{order.confidence:.0%}')
             c.metric('Lines',int(order.lines))
             first = selected.iloc[0]
-            st.write('**Customer:**', str(first.get('master_customer_name') or first.get('sold_to_name_raw')))
-            st.write('**Ship-to:**', str(first.get('master_ship_to_name') or first.get('ship_to_name_raw')))
+            st.write('**Customer:**', readable(first.get('master_customer_name'), readable(first.get('sold_to_name_raw'))))
+            st.write('**Deliver to:**', readable(first.get('master_ship_to_name'), readable(first.get('ship_to_name_raw'))))
             reasons = sorted({reason.strip() for value in selected.review_reasons.dropna() for reason in str(value).split(';') if reason.strip()})
             if reasons:
-                st.warning('**Issues requiring review**\n\n' + '\n'.join(f'- {reason}' for reason in reasons))
+                st.warning('**Order notes and review flags**\n\n' + '\n'.join(f'- {reason}' for reason in reasons))
             visible = ['quality_status','line_number','item_code','item_description','material_id','quantity_as_written','uom_as_written','quantity_each','expected_net_price','currency','proposed_atp_outcome','proposed_ship_quantity','overall_confidence','source_pointer']
             visible = [x for x in visible if x in selected]
-            st.dataframe(selected[visible].style.apply(status_row_style, axis=1),hide_index=True,use_container_width=True)
-            with st.expander('All fields and lineage'):
+            st.subheader('Order lines')
+            names = {'quality_status':'Status', 'line_number':'Line', 'item_code':'Source item code',
+                'item_description':'Product description', 'material_id':'Matched SKU',
+                'quantity_as_written':'Source quantity', 'uom_as_written':'Source unit',
+                'quantity_each':'Quantity (units)', 'expected_net_price':'Expected unit price',
+                'currency':'Currency', 'proposed_atp_outcome':'Availability proposal',
+                'proposed_ship_quantity':'Proposed ship quantity', 'overall_confidence':'Confidence',
+                'source_pointer':'Source reference'}
+            st.dataframe(selected[visible].style.apply(status_row_style, axis=1),hide_index=True,
+                use_container_width=True, column_config={name: st.column_config.Column(label) for name,label in names.items()})
+            with st.expander('Technical details and source lineage'):
                 st.dataframe(selected,hide_index=True,use_container_width=True)
 
     needs_attention = orders[orders.status.isin(['REVIEW', 'FAILED'])]
     ready_orders = orders[orders.status.eq('READY')]
     attention_tab, ready_tab = st.tabs([
-        f'Needs review & failed ({len(needs_attention)})',
+        f'Needs attention ({len(needs_attention)})',
         f'Ready ({len(ready_orders)})'
     ])
     with attention_tab:
         st.caption('Review orders needing attention. FAILED orders and lines are highlighted in red.')
         render_order_review(needs_attention, 'attention')
     with ready_tab:
-        st.caption('Orders that passed current readiness checks. READY is not a recorded approval.')
+        st.caption('Passed current readiness checks · Awaiting approval workflow')
         render_order_review(ready_orders, 'ready')
