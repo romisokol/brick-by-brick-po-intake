@@ -6,8 +6,19 @@ import pypdfium2 as pdfium
 import pandas as pd
 import streamlit as st
 import altair as alt
-from database import load_lines, source_files
-from logic import orders_from_lines, select_order
+from database import (load_lines, source_files, ensure_approval_tables, load_approved,
+    record_decision, gold_rows_for_order, check_not_stale, StaleGoldError)
+from logic import (orders_from_lines, select_order, ready_order_lines, line_identifier,
+    row_hash, diff_editable_fields, EDITABLE_FIELDS)
+
+def current_actor():
+    """The signed-in reviewer, from the identity Databricks forwards to the
+    app. No fallback: a local `streamlit run` has no forwarded identity, and
+    approvals must never be attributed to the app's own service principal."""
+    try:
+        return st.context.headers.get('X-Forwarded-Email') or None
+    except Exception:
+        return None
 
 st.set_page_config(page_title='Solenne | Order review', page_icon='◈', layout='wide')
 st.markdown('''<style>
@@ -142,7 +153,8 @@ if st.sidebar.button('← Welcome', key='return_to_welcome'):
 page = st.sidebar.radio('Workspace', ['Overview', 'Review queue', 'Order review'])
 st.sidebar.caption('Live Databricks data · View only')
 if st.sidebar.button('Refresh data'):
-    st.session_state.pop('gold_lines', None)
+    for key in ['gold_lines', 'approved', 'approvals_ready', 'approvals_error', 'auto_included']:
+        st.session_state.pop(key, None)
     st.rerun()
 
 st.title(page)
@@ -172,6 +184,43 @@ if lines.empty:
     st.stop()
 orders = orders_from_lines(lines)
 st.caption('Proposed sales orders · quantities in individual units · values in original currencies')
+
+if 'approvals_ready' not in st.session_state:
+    try:
+        ensure_approval_tables()
+        st.session_state.approved = load_approved()
+        st.session_state.approvals_ready = True
+        st.session_state.approvals_error = None
+    except Exception as exc:
+        st.session_state.approved = pd.DataFrame()
+        st.session_state.approvals_ready = False
+        st.session_state.approvals_error = str(exc)
+
+if st.session_state.approvals_ready and not st.session_state.get('auto_included'):
+    # Mentor-suggested rule: READY orders passed every automated check already,
+    # so they're included without waiting on a reviewer click. Still logged.
+    ready_lines = ready_order_lines(lines, orders)
+    approved_ids = set(st.session_state.approved.get('gold_line_id', []))
+    to_write, events = [], []
+    for _, row in ready_lines.iterrows():
+        gold_id, _ = line_identifier(row)
+        if gold_id in approved_ids:
+            continue
+        to_write.append(row)
+        events.append({'action': 'AUTO_APPROVE', 'gold_line_id': gold_id,
+            'source_doc_id': row.get('source_doc_id'), 'po_number': row.get('po_number'),
+            'source_order_index': row.get('source_order_index'), 'line_number': row.get('line_number'),
+            'reason': 'READY order auto-included per mentor-suggested rule.',
+            'source_row_hash': row_hash(row)})
+    if to_write:
+        try:
+            record_decision(to_write, 'system:auto-ready-rule', 'AUTO', events)
+            st.session_state.approved = load_approved()
+            st.toast(f'Auto-included {len(to_write)} line(s) from READY orders into approved orders.')
+        except Exception as exc:
+            st.warning('Could not auto-include READY orders into approved orders.')
+            st.code(str(exc))
+    st.session_state.auto_included = True
 
 if page == 'Overview':
     cols = st.columns(4)
@@ -286,6 +335,65 @@ else:
                 'source_pointer':'Source reference'}
             st.dataframe(selected[visible].style.apply(status_row_style, axis=1),hide_index=True,
                 use_container_width=True, column_config={name: st.column_config.Column(label) for name,label in names.items()})
+
+            st.subheader('Approve this order')
+            if not st.session_state.get('approvals_ready'):
+                st.info('Approval writes are unavailable: ' + str(st.session_state.get('approvals_error')))
+            else:
+                approved_df = st.session_state.approved
+                line_records = selected.to_dict('records')
+                identifiers = [line_identifier(r) for r in line_records]
+                line_ids = [i for i, _ in identifiers]
+                already = approved_df[approved_df.gold_line_id.isin(line_ids)] if not approved_df.empty else approved_df
+                if not already.empty:
+                    first_approved = already.iloc[0]
+                    st.success(f"In approved orders · {first_approved['approved_by']} · "
+                        f"{first_approved['approved_at']} ({first_approved['approval_type']})")
+                if any(is_fallback for _, is_fallback in identifiers):
+                    st.caption('Gold has no durable line_id for one or more lines here; a content-based '
+                        'fallback id is used, which will not survive a re-extraction of the source document.')
+                editable = [c for c in EDITABLE_FIELDS if c in selected]
+                with st.form(key=f'approve_form_{tab_key}_{index}'):
+                    edited = st.data_editor(selected[['line_number'] + editable].reset_index(drop=True),
+                        hide_index=True, use_container_width=True, disabled=['line_number'],
+                        num_rows='fixed', key=f'editor_{tab_key}_{index}')
+                    reason = st.text_input('Reason / note', key=f'reason_{tab_key}_{index}',
+                        placeholder='Why approve, or what you corrected')
+                    submitted = st.form_submit_button('Approve order', type='primary')
+                if submitted:
+                    actor = current_actor()
+                    if not actor:
+                        st.error('No authenticated reviewer identity was forwarded for this session. '
+                            'Approval is blocked. (Use the deployed Databricks App, not a local streamlit run.)')
+                    else:
+                        try:
+                            live = gold_rows_for_order(order)
+                            check_not_stale(line_records, live)
+                            updated_rows, decision_events = [], []
+                            for original, (_, edit_row) in zip(line_records, edited.iterrows()):
+                                merged = dict(original)
+                                merged.update({c: edit_row[c] for c in editable})
+                                gold_id, _ = line_identifier(original)
+                                base = {'gold_line_id': gold_id, 'source_doc_id': original.get('source_doc_id'),
+                                    'po_number': original.get('po_number'),
+                                    'source_order_index': original.get('source_order_index'),
+                                    'line_number': original.get('line_number')}
+                                for field, before, after in diff_editable_fields(original, merged):
+                                    decision_events.append({**base, 'action': 'EDIT', 'field_name': field,
+                                        'before_value': before, 'after_value': after, 'reason': reason})
+                                decision_events.append({**base, 'action': 'APPROVE', 'reason': reason,
+                                    'source_row_hash': row_hash(merged)})
+                                updated_rows.append(merged)
+                            record_decision(updated_rows, actor, 'MANUAL', decision_events)
+                            st.session_state.approved = load_approved()
+                            st.success(f'Approved by {actor}.')
+                            st.rerun()
+                        except StaleGoldError as exc:
+                            st.error(str(exc))
+                        except Exception as exc:
+                            st.error('Approval failed.')
+                            st.code(str(exc))
+
             with st.expander('Technical details and source lineage'):
                 st.dataframe(selected,hide_index=True,use_container_width=True)
 
@@ -299,5 +407,5 @@ else:
         st.caption('Review orders needing attention. FAILED orders and lines are highlighted in red.')
         render_order_review(needs_attention, 'attention')
     with ready_tab:
-        st.caption('Passed current readiness checks · Awaiting approval workflow')
+        st.caption('Passed current readiness checks · Auto-included in approved orders; re-approve here after any correction.')
         render_order_review(ready_orders, 'ready')
