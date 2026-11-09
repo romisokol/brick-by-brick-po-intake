@@ -45,9 +45,24 @@ def select_order(lines, order):
     return lines.loc[mask].copy()
 
 
+# Numeric Gold columns: a whole-table load and a single-order re-query can
+# infer int vs. float for the same column (depending on whether nulls happen
+# to appear in that particular slice), which made identical values hash
+# differently and look like drift. Route these through float() so "6" and
+# "6.0" compare equal.
+NUMERIC_FIELDS = {'source_order_index', 'line_number', 'quantity_each', 'expected_net_price',
+    'proposed_ship_quantity', 'overall_confidence'}
+
 def _cell(row, column):
     value = row.get(column)
-    return '' if value is None or pd.isna(value) else str(value)
+    if value is None or pd.isna(value):
+        return ''
+    if column in NUMERIC_FIELDS:
+        try:
+            return repr(float(value))
+        except (TypeError, ValueError):
+            pass
+    return str(value)
 
 def row_hash(row, columns=SNAPSHOT_FIELDS):
     return hashlib.sha256('|'.join(_cell(row, c) for c in columns).encode('utf-8')).hexdigest()
