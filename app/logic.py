@@ -137,6 +137,22 @@ def build_erp_payload(order, line_records):
         } for r in line_records],
     }
 
+def review_status(orders, approved_df, rejected_df):
+    """Per-order review outcome (Pending/Approved/Rejected), computed here in
+    the app from the two app-owned tables -- never written back to Gold, and
+    never confused with the AI's own status (READY/REVIEW/FAILED). Approved
+    takes precedence over a later rejection, since reject never retracts an
+    approval (see app/README.md)."""
+    def keys_from(df):
+        if df is None or df.empty or not set(ORDER_KEYS).issubset(df.columns):
+            return set()
+        return {tuple(None if pd.isna(v) else v for v in row) for row in df[ORDER_KEYS].itertuples(index=False)}
+    approved_keys, rejected_keys = keys_from(approved_df), keys_from(rejected_df)
+    def status_for(row):
+        key = tuple(None if pd.isna(row[c]) else row[c] for c in ORDER_KEYS)
+        return 'Approved' if key in approved_keys else 'Rejected' if key in rejected_keys else 'Pending'
+    return orders.apply(status_for, axis=1)
+
 def ready_order_lines(lines, orders):
     """Every line belonging to a READY order: the set eligible for automatic inclusion."""
     ready_keys = orders.loc[orders.status.eq('READY'), ORDER_KEYS]
