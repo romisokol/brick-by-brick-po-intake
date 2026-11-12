@@ -17,6 +17,7 @@ GOLD = f'`{CATALOG}`.gold.gold_sales_orders'
 BRONZE = f'`{CATALOG}`.bronze.bronze_documents'
 APPROVED_ORDERS = f'`{CATALOG}`.gold.approved_sales_orders'
 REVIEW_EVENTS = f'`{CATALOG}`.gold.review_events'
+XREF_CORRECTIONS = f'`{CATALOG}`.gold.xref_corrections'
 ORDER_KEYS = ['source_doc_id', 'po_number', 'source_order_index']
 
 
@@ -59,9 +60,9 @@ def source_files(doc_id):
 # --- Approvals: an app-owned schema, separate from pipeline-managed Gold. ---
 
 def ensure_approval_tables():
-    """Creates the two approvals tables if missing. Idempotent; never touches
+    """Creates the three app-owned tables if missing. Idempotent; never touches
     gold_sales_orders itself. A pipeline engineer can instead run this once
-    and grant the app identity MODIFY on just these two tables."""
+    and grant the app identity MODIFY on just these three tables."""
     with connection() as conn, conn.cursor() as cursor:
         cursor.execute(f'''CREATE TABLE IF NOT EXISTS {APPROVED_ORDERS} (
             gold_line_id STRING NOT NULL,
@@ -104,9 +105,44 @@ def ensure_approval_tables():
             reason STRING,
             source_row_hash STRING
         ) USING DELTA''')
+        cursor.execute(f'''CREATE TABLE IF NOT EXISTS {XREF_CORRECTIONS} (
+            correction_id STRING NOT NULL,
+            confirmed_at TIMESTAMP NOT NULL,
+            confirmed_by STRING NOT NULL,
+            source_doc_id STRING,
+            po_number STRING,
+            channel STRING,
+            retailer_item_id STRING,
+            item_description STRING,
+            previous_material_id STRING,
+            confirmed_material_id STRING,
+            reason STRING
+        ) USING DELTA''')
 
 def load_approved():
     return query(f'SELECT * FROM {APPROVED_ORDERS}')
+
+def load_rejections():
+    """Latest REJECT event per order, if any -- review_events is append-only,
+    so a prior reject is never overwritten, just superseded for display."""
+    return query(f'''SELECT source_doc_id, po_number, source_order_index, actor, event_time, reason
+        FROM (SELECT *, ROW_NUMBER() OVER (
+                PARTITION BY source_doc_id, po_number, source_order_index
+                ORDER BY event_time DESC) AS rn
+            FROM {REVIEW_EVENTS} WHERE action = 'REJECT') WHERE rn = 1''')
+
+def record_xref_correction(actor, source_doc_id, po_number, channel, retailer_item_id,
+        item_description, previous_material_id, confirmed_material_id, reason):
+    """Appends a reviewer-confirmed item-code -> SKU mapping. This never writes
+    to the pipeline's own retailer_item_xref table (unknown to this app); it's a
+    durable, auditable feed for a pipeline engineer to merge into it by hand."""
+    with connection() as conn, conn.cursor() as cursor:
+        cursor.execute(f'''INSERT INTO {XREF_CORRECTIONS}
+            (correction_id, confirmed_at, confirmed_by, source_doc_id, po_number, channel,
+             retailer_item_id, item_description, previous_material_id, confirmed_material_id, reason)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?)''',
+            [str(uuid.uuid4()), datetime.now(timezone.utc), actor, source_doc_id, po_number, channel,
+             retailer_item_id, item_description, previous_material_id, confirmed_material_id, reason])
 
 def gold_rows_for_order(order):
     """Re-reads an order's lines straight from Gold, bypassing the session

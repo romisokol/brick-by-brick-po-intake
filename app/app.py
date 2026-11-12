@@ -7,9 +7,11 @@ import pandas as pd
 import streamlit as st
 import altair as alt
 from database import (load_lines, source_files, ensure_approval_tables, load_approved,
-    record_decision, gold_rows_for_order, check_not_stale, StaleGoldError)
+    load_rejections, record_decision, record_xref_correction, gold_rows_for_order,
+    check_not_stale, StaleGoldError)
 from logic import (orders_from_lines, select_order, ready_order_lines, line_identifier,
-    row_hash, diff_editable_fields, EDITABLE_FIELDS)
+    row_hash, diff_editable_fields, suggest_skus, build_erp_payload,
+    EDITABLE_FIELDS, INVENTORY_FIELDS)
 
 def current_actor():
     """The signed-in reviewer, from the identity Databricks forwards to the
@@ -153,7 +155,7 @@ if st.sidebar.button('← Welcome', key='return_to_welcome'):
 page = st.sidebar.radio('Workspace', ['Overview', 'Review queue', 'Order review'])
 st.sidebar.caption('Live Databricks data · View only')
 if st.sidebar.button('Refresh data'):
-    for key in ['gold_lines', 'approved', 'approvals_ready', 'approvals_error', 'auto_included']:
+    for key in ['gold_lines', 'approved', 'rejected', 'approvals_ready', 'approvals_error', 'auto_included']:
         st.session_state.pop(key, None)
     st.rerun()
 
@@ -189,10 +191,12 @@ if 'approvals_ready' not in st.session_state:
     try:
         ensure_approval_tables()
         st.session_state.approved = load_approved()
+        st.session_state.rejected = load_rejections()
         st.session_state.approvals_ready = True
         st.session_state.approvals_error = None
     except Exception as exc:
         st.session_state.approved = pd.DataFrame()
+        st.session_state.rejected = pd.DataFrame()
         st.session_state.approvals_ready = False
         st.session_state.approvals_error = str(exc)
 
@@ -314,6 +318,15 @@ else:
                 st.success('READY · Passed current readiness checks')
             else:
                 st.warning('REVIEW · Needs human review')
+            rejected_df = st.session_state.get('rejected', pd.DataFrame())
+            if not rejected_df.empty:
+                match = rejected_df[
+                    (rejected_df.source_doc_id == order.source_doc_id) &
+                    (rejected_df.po_number.eq(order.po_number) if pd.notna(order.po_number) else rejected_df.po_number.isna()) &
+                    (rejected_df.source_order_index.eq(order.source_order_index) if pd.notna(order.source_order_index) else rejected_df.source_order_index.isna())]
+                if not match.empty:
+                    r = match.iloc[0]
+                    st.error(f"Rejected by {r['actor']} · {r['event_time']} — {r['reason'] or 'No reason given'}")
             b,c = st.columns(2)
             b.metric('Confidence','Unknown' if pd.isna(order.confidence) else f'{order.confidence:.0%}')
             c.metric('Lines',int(order.lines))
@@ -352,9 +365,37 @@ else:
                 if any(is_fallback for _, is_fallback in identifiers):
                     st.caption('Gold has no durable line_id for one or more lines here; a content-based '
                         'fallback id is used, which will not survive a re-extraction of the source document.')
-                editable = [c for c in EDITABLE_FIELDS if c in selected]
+                if not already.empty:
+                    payload = build_erp_payload(order, already.to_dict('records'))
+                    st.download_button('Download mock ERP export (JSON)', json.dumps(payload, indent=2, default=str),
+                        file_name=f'erp_export_{order.source_doc_id}_{order.po_number}.json', mime='application/json',
+                        key=f'erp_export_{tab_key}_{index}')
+
+                override_key = f'sku_override_{tab_key}_{index}'
+                overrides = st.session_state.setdefault(override_key, {})
+                needs_sku = selected[selected['material_id'].isna() | selected['quality_status'].ne('READY')]
+                if not needs_sku.empty:
+                    with st.expander(f'Suggested SKU matches ({len(needs_sku)} line(s))'):
+                        st.caption('Matched against SKUs already resolved elsewhere in this session, '
+                            'not the full product catalog, which this app has no access to.')
+                        for _, line_row in needs_sku.iterrows():
+                            candidates = suggest_skus(lines, line_row)
+                            if not candidates:
+                                continue
+                            st.write(f"Line {line_row.get('line_number')} · {readable(line_row.get('item_description'))}")
+                            cols = st.columns(len(candidates))
+                            for col, (material_id, description, score) in zip(cols, candidates):
+                                if col.button(f'{material_id} · {description[:24]}', key=f'{override_key}_{line_row.get("line_number")}_{material_id}'):
+                                    overrides[line_row.get('line_number')] = material_id
+                                    st.rerun()
+
+                editable = [c for c in EDITABLE_FIELDS + INVENTORY_FIELDS if c in selected]
+                base_table = selected[['line_number'] + editable].reset_index(drop=True)
+                if overrides:
+                    for line_number, material_id in overrides.items():
+                        base_table.loc[base_table.line_number.eq(line_number), 'material_id'] = material_id
                 with st.form(key=f'approve_form_{tab_key}_{index}'):
-                    edited = st.data_editor(selected[['line_number'] + editable].reset_index(drop=True),
+                    edited = st.data_editor(base_table,
                         hide_index=True, use_container_width=True, disabled=['line_number'],
                         num_rows='fixed', key=f'editor_{tab_key}_{index}')
                     reason = st.text_input('Reason / note', key=f'reason_{tab_key}_{index}',
@@ -369,7 +410,7 @@ else:
                         try:
                             live = gold_rows_for_order(order)
                             check_not_stale(line_records, live)
-                            updated_rows, decision_events = [], []
+                            updated_rows, decision_events, xref_fixes = [], [], []
                             for original, (_, edit_row) in zip(line_records, edited.iterrows()):
                                 merged = dict(original)
                                 merged.update({c: edit_row[c] for c in editable})
@@ -378,20 +419,53 @@ else:
                                     'po_number': original.get('po_number'),
                                     'source_order_index': original.get('source_order_index'),
                                     'line_number': original.get('line_number')}
-                                for field, before, after in diff_editable_fields(original, merged):
+                                for field, before, after in diff_editable_fields(original, merged, EDITABLE_FIELDS):
                                     decision_events.append({**base, 'action': 'EDIT', 'field_name': field,
+                                        'before_value': before, 'after_value': after, 'reason': reason})
+                                    if field == 'material_id':
+                                        xref_fixes.append((original, before, after))
+                                for field, before, after in diff_editable_fields(original, merged, INVENTORY_FIELDS):
+                                    decision_events.append({**base, 'action': 'INVENTORY_OVERRIDE', 'field_name': field,
                                         'before_value': before, 'after_value': after, 'reason': reason})
                                 decision_events.append({**base, 'action': 'APPROVE', 'reason': reason,
                                     'source_row_hash': row_hash(merged)})
                                 updated_rows.append(merged)
                             record_decision(updated_rows, actor, 'MANUAL', decision_events)
+                            for original, before, after in xref_fixes:
+                                record_xref_correction(actor, original.get('source_doc_id'), original.get('po_number'),
+                                    original.get('channel'), original.get('item_code'), original.get('item_description'),
+                                    before or None, after, reason)
                             st.session_state.approved = load_approved()
+                            overrides.clear()
                             st.success(f'Approved by {actor}.')
                             st.rerun()
                         except StaleGoldError as exc:
                             st.error(str(exc))
                         except Exception as exc:
                             st.error('Approval failed.')
+                            st.code(str(exc))
+
+                with st.form(key=f'reject_form_{tab_key}_{index}'):
+                    reject_reason = st.text_input('Reason for rejection', key=f'reject_reason_{tab_key}_{index}',
+                        placeholder='Why this order should not proceed')
+                    rejected_submitted = st.form_submit_button('Reject order')
+                if rejected_submitted:
+                    actor = current_actor()
+                    if not actor:
+                        st.error('No authenticated reviewer identity was forwarded for this session. '
+                            'Rejection is blocked. (Use the deployed Databricks App, not a local streamlit run.)')
+                    elif not reject_reason.strip():
+                        st.error('A reason is required to reject an order.')
+                    else:
+                        try:
+                            record_decision([], actor, 'REJECT', [{'action': 'REJECT',
+                                'source_doc_id': order.source_doc_id, 'po_number': order.po_number,
+                                'source_order_index': order.source_order_index, 'reason': reject_reason}])
+                            st.session_state.rejected = load_rejections()
+                            st.success('Order rejected.')
+                            st.rerun()
+                        except Exception as exc:
+                            st.error('Rejection failed.')
                             st.code(str(exc))
 
             with st.expander('Technical details and source lineage'):
