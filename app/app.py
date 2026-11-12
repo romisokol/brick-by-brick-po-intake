@@ -181,7 +181,8 @@ if lines.empty:
     st.info('Gold currently contains no order lines.')
     st.stop()
 
-channels = st.sidebar.multiselect('Channels', sorted(lines.channel.dropna().unique()))
+total_lines_loaded = len(lines)
+channels = st.sidebar.multiselect('Channels', sorted(lines.channel.dropna().unique()), key='channel_filter')
 if channels:
     lines = lines[lines.channel.isin(channels)]
 if lines.empty:
@@ -189,6 +190,12 @@ if lines.empty:
     st.stop()
 orders = orders_from_lines(lines)
 st.caption('Proposed sales orders · quantities in individual units · values in original currencies')
+if channels:
+    st.sidebar.caption(f'Loaded from Gold: {total_lines_loaded:,} lines total. '
+        f'Channel filter above narrows this to {len(lines):,} lines / {len(orders):,} orders.')
+else:
+    st.sidebar.caption(f'Loaded from Gold: {total_lines_loaded:,} lines across {len(orders):,} orders -- '
+        'the true total, before the status/handled filters below.')
 
 if 'approvals_ready' not in st.session_state:
     try:
@@ -230,7 +237,12 @@ if st.session_state.approvals_ready and not st.session_state.get('auto_included'
     st.session_state.auto_included = True
 
 orders['review_status'] = review_status(orders, st.session_state.get('approved'), st.session_state.get('rejected'))
-show_handled = st.sidebar.checkbox('Show approved/rejected orders in queues', value=False)
+if st.sidebar.button('Show everything (clear all filters)'):
+    st.session_state['show_handled_toggle'] = True
+    st.session_state['status_filter'] = ['FAILED', 'REVIEW', 'READY']
+    st.session_state['channel_filter'] = []
+    st.rerun()
+show_handled = st.sidebar.checkbox('Show approved/rejected orders in queues', value=False, key='show_handled_toggle')
 st.sidebar.caption('Approving or rejecting an order moves it out of the active queue below, '
     'since neither writes back to Gold\'s own status -- this filter is computed here in the app.')
 
@@ -251,10 +263,12 @@ with st.sidebar.expander('⚠️ Reset demo data'):
 
 if page == 'Review queue':
     st.caption('Prioritized by missing or low confidence, then by currency and known order value.')
-    statuses = st.multiselect('Order status', ['FAILED','REVIEW','READY'], default=['FAILED','REVIEW'])
+    statuses = st.multiselect('Order status', ['FAILED','REVIEW','READY'], default=['FAILED','REVIEW'], key='status_filter')
     queue = orders[orders.status.isin(statuses)].copy()
     if not show_handled:
         queue = queue[queue.review_status.eq('Pending')]
+    st.caption(f'Showing {len(queue):,} of {len(orders):,} total orders '
+        f'({len(lines):,} total lines loaded from Gold).')
     search = st.text_input('Search PO, document, or customer')
     if search:
         mask = queue[['source_doc_id','po_number','customer']].fillna('').astype(str).apply(lambda x: x.str.contains(search,case=False,regex=False)).any(axis=1)
