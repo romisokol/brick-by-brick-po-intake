@@ -335,8 +335,9 @@ else:
             st.write('**Deliver to:**', readable(first.get('master_ship_to_name'), readable(first.get('ship_to_name_raw'))))
             reasons = sorted({reason.strip() for value in selected.review_reasons.dropna() for reason in str(value).split(';') if reason.strip()})
             if reasons:
-                st.warning('**Order notes and review flags**\n\n' + '\n'.join(f'- {reason}' for reason in reasons))
-            visible = ['quality_status','line_number','item_code','item_description','material_id','quantity_as_written','uom_as_written','quantity_each','expected_net_price','currency','proposed_atp_outcome','proposed_ship_quantity','overall_confidence','source_pointer']
+                st.warning('**Order notes and review flags** (see the "Why flagged" column below for which line triggered each one)\n\n'
+                    + '\n'.join(f'- {reason}' for reason in reasons))
+            visible = ['quality_status','line_number','item_code','item_description','material_id','quantity_as_written','uom_as_written','quantity_each','expected_net_price','currency','proposed_atp_outcome','proposed_ship_quantity','overall_confidence','review_reasons','source_pointer']
             visible = [x for x in visible if x in selected]
             st.subheader('Order lines')
             names = {'quality_status':'Status', 'line_number':'Line', 'item_code':'Source item code',
@@ -345,9 +346,15 @@ else:
                 'quantity_each':'Quantity (units)', 'expected_net_price':'Expected unit price',
                 'currency':'Currency', 'proposed_atp_outcome':'Availability proposal',
                 'proposed_ship_quantity':'Proposed ship quantity', 'overall_confidence':'Confidence',
-                'source_pointer':'Source reference'}
-            st.dataframe(selected[visible].style.apply(status_row_style, axis=1),hide_index=True,
-                use_container_width=True, column_config={name: st.column_config.Column(label) for name,label in names.items()})
+                'review_reasons':'Why flagged', 'source_pointer':'Source reference'}
+            display_lines = selected[visible].copy()
+            if 'review_reasons' in display_lines:
+                display_lines['review_reasons'] = display_lines['review_reasons'].fillna('').str.replace('; ', ' · ', regex=False)
+            column_config = {name: st.column_config.Column(label) for name, label in names.items()}
+            if 'review_reasons' in column_config:
+                column_config['review_reasons'] = st.column_config.TextColumn(names['review_reasons'], width='large')
+            st.dataframe(display_lines.style.apply(status_row_style, axis=1),hide_index=True,
+                use_container_width=True, column_config=column_config)
 
             st.subheader('Approve this order')
             if not st.session_state.get('approvals_ready'):
