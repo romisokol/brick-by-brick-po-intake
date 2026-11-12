@@ -43,6 +43,7 @@ From app/: `python -m pip install -r requirements.txt`, configure Databricks SDK
 - No region isolation or auditor/reviewer roles are implemented yet. This is a restricted team preview, not GOV-2–4 completion.
 - Sources are read through Bronze bytes; formats PDF/image/text can preview; XLSX downloads only. Email attachment rows show their parent email, explicitly labeled. Source files above 16 MB do not preview. Document ID selection is parameterized.
 - Gold is loaded to a session-local snapshot (up to 20,000 lines). Refresh from Gold loads new data; no global cross-user data cache. Larger data requires server-side pagination.
+- **Reset demo data:** a sidebar "⚠️ Reset demo data" control, gated behind typing `RESET` to enable the button, permanently deletes every row in all three app-owned tables (approvals, audit log, xref corrections). Never touches Gold. This is a deliberate, manual action for demoing/testing only -- ordinary "Refresh data" and a normal redeploy never clear approval history, since that history is the append-only audit trail HIL-4 requires.
 - Complexity metrics, evaluation feedback, SLA, ingestion cost, and maintainable retailer-rule auditing remain separate work.
 
 ## Requirements covered in this milestone
