@@ -9,7 +9,7 @@ from database import (load_lines, source_files, ensure_approval_tables, load_app
     load_rejections, record_decision, record_xref_correction, gold_rows_for_order,
     check_not_stale, StaleGoldError)
 from logic import (orders_from_lines, select_order, ready_order_lines, line_identifier,
-    row_hash, diff_editable_fields, suggest_skus, build_erp_payload,
+    row_hash, diff_editable_fields, suggest_skus, build_erp_payload, review_status,
     EDITABLE_FIELDS, INVENTORY_FIELDS)
 
 def current_actor():
@@ -229,16 +229,25 @@ if st.session_state.approvals_ready and not st.session_state.get('auto_included'
             st.code(str(exc))
     st.session_state.auto_included = True
 
+orders['review_status'] = review_status(orders, st.session_state.get('approved'), st.session_state.get('rejected'))
+show_handled = st.sidebar.checkbox('Show approved/rejected orders in queues', value=False)
+st.sidebar.caption('Approving or rejecting an order moves it out of the active queue below, '
+    'since neither writes back to Gold\'s own status -- this filter is computed here in the app.')
+
 if page == 'Review queue':
     st.caption('Prioritized by missing or low confidence, then by currency and known order value.')
     statuses = st.multiselect('Order status', ['FAILED','REVIEW','READY'], default=['FAILED','REVIEW'])
     queue = orders[orders.status.isin(statuses)].copy()
+    if not show_handled:
+        queue = queue[queue.review_status.eq('Pending')]
     search = st.text_input('Search PO, document, or customer')
     if search:
         mask = queue[['source_doc_id','po_number','customer']].fillna('').astype(str).apply(lambda x: x.str.contains(search,case=False,regex=False)).any(axis=1)
         queue = queue[mask]
     st.dataframe(queue.style.apply(status_row_style, axis=1), hide_index=True, use_container_width=True,
-        column_config={'confidence': st.column_config.NumberColumn(format='%.2f'), 'known_value':st.column_config.NumberColumn('Known value (original currency)',format='%.2f')})
+        column_config={'confidence': st.column_config.NumberColumn(format='%.2f'),
+            'known_value':st.column_config.NumberColumn('Known value (original currency)',format='%.2f'),
+            'review_status': st.column_config.Column('Review status')})
     st.caption('Open Order review in the sidebar to inspect an order. Nothing in this screen changes source data.')
 
 else:
@@ -255,6 +264,8 @@ else:
                     order_index = int(order_index)
                 parts.append(f'order {order_index}')
             parts.append(str(r.status))
+            if r.review_status != 'Pending':
+                parts.append(r.review_status)
             labels.append(' · '.join(parts))
         index = st.selectbox('Choose an order', range(len(tab_orders)), format_func=lambda i: labels[i], key=f'order_{tab_key}')
         order = tab_orders.iloc[index]
@@ -455,6 +466,11 @@ else:
                 st.dataframe(selected,hide_index=True,use_container_width=True)
 
     needs_attention = orders[orders.status.isin(['REVIEW', 'FAILED'])]
+    # READY orders are auto-included on load (see above), so they're always
+    # "Approved" -- the show_handled filter only applies to the REVIEW/FAILED
+    # work queue; the Ready tab stays browsable for re-approving after a fix.
+    if not show_handled:
+        needs_attention = needs_attention[needs_attention.review_status.eq('Pending')]
     ready_orders = orders[orders.status.eq('READY')]
     attention_tab, ready_tab = st.tabs([
         f'Needs attention ({len(needs_attention)})',
