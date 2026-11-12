@@ -10,7 +10,7 @@ from database import (load_lines, source_files, ensure_approval_tables, load_app
     check_not_stale, StaleGoldError)
 from logic import (orders_from_lines, select_order, ready_order_lines, line_identifier,
     row_hash, diff_editable_fields, suggest_skus, build_erp_payload, review_status,
-    EDITABLE_FIELDS, INVENTORY_FIELDS)
+    filtered_reasons, EDITABLE_FIELDS, INVENTORY_FIELDS)
 
 def current_actor():
     """The signed-in reviewer, from the identity Databricks forwards to the
@@ -270,6 +270,9 @@ else:
         index = st.selectbox('Choose an order', range(len(tab_orders)), format_func=lambda i: labels[i], key=f'order_{tab_key}')
         order = tab_orders.iloc[index]
         selected = select_order(lines, order)
+        if order.status == 'READY' and 'review_reasons' in selected:
+            selected = selected.copy()
+            selected['review_reasons'] = selected['review_reasons'].apply(filtered_reasons)
         left, right = st.columns([1, 1.3])
         with left:
             st.subheader('Source evidence')

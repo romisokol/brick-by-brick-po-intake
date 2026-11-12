@@ -153,6 +153,20 @@ def review_status(orders, approved_df, rejected_df):
         return 'Approved' if key in approved_keys else 'Rejected' if key in rejected_keys else 'Pending'
     return orders.apply(status_for, axis=1)
 
+# Purely a display choice for orders that already passed every automated
+# check: an unresolved ship-to is still informational there (Za's rule --
+# it must never flip status), so it's suppressed from view rather than
+# cluttering a READY order. Still shown in full for REVIEW/FAILED orders,
+# where a reviewer is already looking and the context matters.
+SUPPRESSED_WHEN_READY = ['ship-to unresolved', 'ship_to_unresolved', 'ship to unresolved']
+
+def filtered_reasons(value, suppress=SUPPRESSED_WHEN_READY):
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return value
+    kept = [r.strip() for r in str(value).split(';')
+        if r.strip() and not any(s in r.strip().lower() for s in suppress)]
+    return '; '.join(kept) if kept else None
+
 def ready_order_lines(lines, orders):
     """Every line belonging to a READY order: the set eligible for automatic inclusion."""
     ready_keys = orders.loc[orders.status.eq('READY'), ORDER_KEYS]
