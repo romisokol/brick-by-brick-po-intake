@@ -5,11 +5,12 @@ from email.parser import BytesParser
 import pypdfium2 as pdfium
 import pandas as pd
 import streamlit as st
-import altair as alt
 from database import (load_lines, source_files, ensure_approval_tables, load_approved,
-    record_decision, gold_rows_for_order, check_not_stale, StaleGoldError)
+    load_rejections, record_decision, record_xref_correction, gold_rows_for_order,
+    check_not_stale, StaleGoldError)
 from logic import (orders_from_lines, select_order, ready_order_lines, line_identifier,
-    row_hash, diff_editable_fields, EDITABLE_FIELDS)
+    row_hash, diff_editable_fields, suggest_skus, build_erp_payload,
+    EDITABLE_FIELDS, INVENTORY_FIELDS)
 
 def current_actor():
     """The signed-in reviewer, from the identity Databricks forwards to the
@@ -37,7 +38,7 @@ if not st.session_state.get('workspace_entered', False):
     .welcome-title{font-family:Georgia,serif;font-size:clamp(44px,6vw,78px);font-weight:400;line-height:1.06;color:#18334b;margin:0 0 26px}
     .welcome-copy{font-size:18px;line-height:1.7;color:#63717b;max-width:560px;margin-bottom:28px}
     .welcome-panel{background:#18334b;border-radius:20px;padding:48px 38px;color:#f7f5f0;margin-top:12px}
-    .welcome-monogram{font-family:Georgia,serif;font-size:72px;color:#d4bf8c;border-bottom:1px solid #61707a;padding-bottom:30px;margin-bottom:32px}
+    .welcome-monogram{font-family:Georgia,serif;font-size:32px;letter-spacing:.04em;color:#d4bf8c;border-bottom:1px solid #61707a;padding-bottom:30px;margin-bottom:32px}
     .welcome-step{font-size:18px;margin:26px 0 10px;color:#fff}
     .welcome-detail{font-size:14px;line-height:1.65;color:#c3ced6}
     div.stButton > button[kind="primary"]{background:#18334b;border:1px solid #18334b;color:white;border-radius:8px;padding:12px 28px}
@@ -46,13 +47,18 @@ if not st.session_state.get('workspace_entered', False):
     intro, spacer, panel = st.columns([1.3,.12,1])
     with intro:
         st.markdown('<div class="welcome-kicker">ORDER OPERATIONS WORKSPACE</div><div class="welcome-title">Every order.<br>A clearer picture.</div><div class="welcome-copy">From incoming purchase orders to informed decisions. Explore your order book, focus on exceptions, and review every detail alongside its source.</div>', unsafe_allow_html=True)
+        access_code = st.text_input('Workspace access code', type='password', key='access_code',
+            placeholder='Enter your access code', label_visibility='collapsed')
         if st.button('Enter workspace →', type='primary', key='enter_workspace'):
-            st.session_state.workspace_entered = True
-            st.rerun()
+            if access_code:
+                st.session_state.workspace_entered = True
+                st.rerun()
+            else:
+                st.error('Enter your access code to continue.')
         st.caption('Access authenticated by Databricks')
         st.caption('Live workspace tables · Synthetic project documents · Read-only preview')
     with panel:
-        st.markdown('<div class="welcome-panel"><div class="welcome-monogram">MS</div><div class="welcome-step">01 &nbsp; See the whole picture</div><div class="welcome-detail">Order activity and quality, in one overview.</div><div class="welcome-step">02 &nbsp; Focus your attention</div><div class="welcome-detail">Find orders requiring review and understand why.</div><div class="welcome-step">03 &nbsp; Follow the evidence</div><div class="welcome-detail">Compare extracted details with the original document.</div></div>', unsafe_allow_html=True)
+        st.markdown('<div class="welcome-panel"><div class="welcome-monogram">Maison Solenne</div><div class="welcome-step">01 &nbsp; Focus your attention</div><div class="welcome-detail">Find orders requiring review and understand why.</div><div class="welcome-step">02 &nbsp; Follow the evidence</div><div class="welcome-detail">Compare extracted details with the original document.</div></div>', unsafe_allow_html=True)
     st.stop()
 
 def status_row_style(row):
@@ -144,16 +150,15 @@ def render_source(data, extension, key):
             st.info('Download the original file to view this format.')
 
 
-COLORS = {'READY':'#5B9476', 'REVIEW':'#C49A45', 'FAILED':'#BE6670'}
 st.sidebar.title('MAISON SOLENNE')
 st.sidebar.caption('ORDER OPERATIONS')
 if st.sidebar.button('← Welcome', key='return_to_welcome'):
     st.session_state.workspace_entered = False
     st.rerun()
-page = st.sidebar.radio('Workspace', ['Overview', 'Review queue', 'Order review'])
+page = st.sidebar.radio('Workspace', ['Review queue', 'Order review'])
 st.sidebar.caption('Live Databricks data · View only')
 if st.sidebar.button('Refresh data'):
-    for key in ['gold_lines', 'approved', 'approvals_ready', 'approvals_error', 'auto_included']:
+    for key in ['gold_lines', 'approved', 'rejected', 'approvals_ready', 'approvals_error', 'auto_included']:
         st.session_state.pop(key, None)
     st.rerun()
 
@@ -189,10 +194,12 @@ if 'approvals_ready' not in st.session_state:
     try:
         ensure_approval_tables()
         st.session_state.approved = load_approved()
+        st.session_state.rejected = load_rejections()
         st.session_state.approvals_ready = True
         st.session_state.approvals_error = None
     except Exception as exc:
         st.session_state.approved = pd.DataFrame()
+        st.session_state.rejected = pd.DataFrame()
         st.session_state.approvals_ready = False
         st.session_state.approvals_error = str(exc)
 
@@ -222,34 +229,7 @@ if st.session_state.approvals_ready and not st.session_state.get('auto_included'
             st.code(str(exc))
     st.session_state.auto_included = True
 
-if page == 'Overview':
-    cols = st.columns(4)
-    cols[0].metric('Proposed orders', f'{len(orders):,}')
-    cols[1].metric('Order lines', f'{len(lines):,}')
-    cols[2].metric('Needs attention', f'{orders.status.ne("READY").sum():,}')
-    cols[3].metric('Ready order share', f'{orders.status.eq("READY").mean():.1%}')
-    st.caption('Ready share is a routing metric, not measured straight-through processing or accuracy.')
-    left, right = st.columns(2)
-    with left:
-        st.subheader('Line quality')
-        counts = lines.groupby('quality_status').size().reset_index(name='lines')
-        st.altair_chart(alt.Chart(counts).mark_arc(innerRadius=65).encode(theta='lines:Q', color=alt.Color('quality_status:N', scale=alt.Scale(domain=list(COLORS), range=list(COLORS.values()))), tooltip=['quality_status','lines']).properties(height=300), use_container_width=True)
-    with right:
-        st.subheader('Lines by channel')
-        counts = lines.groupby('channel').size().reset_index(name='lines')
-        st.altair_chart(alt.Chart(counts).mark_bar(color='#527FA3').encode(x='lines:Q',y=alt.Y('channel:N',sort='-x', title=None, axis=alt.Axis(labelLimit=220)),tooltip=['channel','lines']).properties(height=300), use_container_width=True)
-    left, right = st.columns(2)
-    with left:
-        st.subheader('Reasons for review')
-        reasons = lines.loc[lines.needs_review.fillna(True), 'review_reasons'].dropna().str.split('; ').explode()
-        counts = reasons[reasons.ne('')].value_counts().head(8).rename_axis('reason').reset_index(name='lines')
-        st.altair_chart(alt.Chart(counts).mark_bar(color='#527FA3').encode(x='lines:Q', y=alt.Y('reason:N',sort='-x', title=None, axis=alt.Axis(labelLimit=280)), tooltip=['reason','lines']).properties(height=300),use_container_width=True)
-    with right:
-        st.subheader('Inventory proposals')
-        counts = lines.groupby('proposed_atp_outcome').size().reset_index(name='lines')
-        st.altair_chart(alt.Chart(counts).mark_bar(color='#527FA3').encode(x=alt.X('proposed_atp_outcome:N', title='Availability proposal', axis=alt.Axis(labelAngle=0)), y='lines:Q',tooltip=['proposed_atp_outcome','lines']).properties(height=300),use_container_width=True)
-
-elif page == 'Review queue':
+if page == 'Review queue':
     st.caption('Prioritized by missing or low confidence, then by currency and known order value.')
     statuses = st.multiselect('Order status', ['FAILED','REVIEW','READY'], default=['FAILED','REVIEW'])
     queue = orders[orders.status.isin(statuses)].copy()
@@ -314,6 +294,15 @@ else:
                 st.success('READY · Passed current readiness checks')
             else:
                 st.warning('REVIEW · Needs human review')
+            rejected_df = st.session_state.get('rejected', pd.DataFrame())
+            if not rejected_df.empty:
+                match = rejected_df[
+                    (rejected_df.source_doc_id == order.source_doc_id) &
+                    (rejected_df.po_number.eq(order.po_number) if pd.notna(order.po_number) else rejected_df.po_number.isna()) &
+                    (rejected_df.source_order_index.eq(order.source_order_index) if pd.notna(order.source_order_index) else rejected_df.source_order_index.isna())]
+                if not match.empty:
+                    r = match.iloc[0]
+                    st.error(f"Rejected by {r['actor']} · {r['event_time']} — {r['reason'] or 'No reason given'}")
             b,c = st.columns(2)
             b.metric('Confidence','Unknown' if pd.isna(order.confidence) else f'{order.confidence:.0%}')
             c.metric('Lines',int(order.lines))
@@ -322,8 +311,9 @@ else:
             st.write('**Deliver to:**', readable(first.get('master_ship_to_name'), readable(first.get('ship_to_name_raw'))))
             reasons = sorted({reason.strip() for value in selected.review_reasons.dropna() for reason in str(value).split(';') if reason.strip()})
             if reasons:
-                st.warning('**Order notes and review flags**\n\n' + '\n'.join(f'- {reason}' for reason in reasons))
-            visible = ['quality_status','line_number','item_code','item_description','material_id','quantity_as_written','uom_as_written','quantity_each','expected_net_price','currency','proposed_atp_outcome','proposed_ship_quantity','overall_confidence','source_pointer']
+                st.warning('**Order notes and review flags** (see the "Why flagged" column below for which line triggered each one)\n\n'
+                    + '\n'.join(f'- {reason}' for reason in reasons))
+            visible = ['quality_status','line_number','item_code','item_description','material_id','quantity_as_written','uom_as_written','quantity_each','expected_net_price','currency','proposed_atp_outcome','proposed_ship_quantity','overall_confidence','review_reasons','source_pointer']
             visible = [x for x in visible if x in selected]
             st.subheader('Order lines')
             names = {'quality_status':'Status', 'line_number':'Line', 'item_code':'Source item code',
@@ -332,9 +322,15 @@ else:
                 'quantity_each':'Quantity (units)', 'expected_net_price':'Expected unit price',
                 'currency':'Currency', 'proposed_atp_outcome':'Availability proposal',
                 'proposed_ship_quantity':'Proposed ship quantity', 'overall_confidence':'Confidence',
-                'source_pointer':'Source reference'}
-            st.dataframe(selected[visible].style.apply(status_row_style, axis=1),hide_index=True,
-                use_container_width=True, column_config={name: st.column_config.Column(label) for name,label in names.items()})
+                'review_reasons':'Why flagged', 'source_pointer':'Source reference'}
+            display_lines = selected[visible].copy()
+            if 'review_reasons' in display_lines:
+                display_lines['review_reasons'] = display_lines['review_reasons'].fillna('').str.replace('; ', ' · ', regex=False)
+            column_config = {name: st.column_config.Column(label) for name, label in names.items()}
+            if 'review_reasons' in column_config:
+                column_config['review_reasons'] = st.column_config.TextColumn(names['review_reasons'], width='large')
+            st.dataframe(display_lines.style.apply(status_row_style, axis=1),hide_index=True,
+                use_container_width=True, column_config=column_config)
 
             st.subheader('Approve this order')
             if not st.session_state.get('approvals_ready'):
@@ -352,9 +348,37 @@ else:
                 if any(is_fallback for _, is_fallback in identifiers):
                     st.caption('Gold has no durable line_id for one or more lines here; a content-based '
                         'fallback id is used, which will not survive a re-extraction of the source document.')
-                editable = [c for c in EDITABLE_FIELDS if c in selected]
+                if not already.empty:
+                    payload = build_erp_payload(order, already.to_dict('records'))
+                    st.download_button('Download mock ERP export (JSON)', json.dumps(payload, indent=2, default=str),
+                        file_name=f'erp_export_{order.source_doc_id}_{order.po_number}.json', mime='application/json',
+                        key=f'erp_export_{tab_key}_{index}')
+
+                override_key = f'sku_override_{tab_key}_{index}'
+                overrides = st.session_state.setdefault(override_key, {})
+                needs_sku = selected[selected['material_id'].isna() | selected['quality_status'].ne('READY')]
+                if not needs_sku.empty:
+                    with st.expander(f'Suggested SKU matches ({len(needs_sku)} line(s))'):
+                        st.caption('Matched against SKUs already resolved elsewhere in this session, '
+                            'not the full product catalog, which this app has no access to.')
+                        for _, line_row in needs_sku.iterrows():
+                            candidates = suggest_skus(lines, line_row)
+                            if not candidates:
+                                continue
+                            st.write(f"Line {line_row.get('line_number')} · {readable(line_row.get('item_description'))}")
+                            cols = st.columns(len(candidates))
+                            for col, (material_id, description, score) in zip(cols, candidates):
+                                if col.button(f'{material_id} · {description[:24]}', key=f'{override_key}_{line_row.get("line_number")}_{material_id}'):
+                                    overrides[line_row.get('line_number')] = material_id
+                                    st.rerun()
+
+                editable = [c for c in EDITABLE_FIELDS + INVENTORY_FIELDS if c in selected]
+                base_table = selected[['line_number'] + editable].reset_index(drop=True)
+                if overrides:
+                    for line_number, material_id in overrides.items():
+                        base_table.loc[base_table.line_number.eq(line_number), 'material_id'] = material_id
                 with st.form(key=f'approve_form_{tab_key}_{index}'):
-                    edited = st.data_editor(selected[['line_number'] + editable].reset_index(drop=True),
+                    edited = st.data_editor(base_table,
                         hide_index=True, use_container_width=True, disabled=['line_number'],
                         num_rows='fixed', key=f'editor_{tab_key}_{index}')
                     reason = st.text_input('Reason / note', key=f'reason_{tab_key}_{index}',
@@ -369,7 +393,7 @@ else:
                         try:
                             live = gold_rows_for_order(order)
                             check_not_stale(line_records, live)
-                            updated_rows, decision_events = [], []
+                            updated_rows, decision_events, xref_fixes = [], [], []
                             for original, (_, edit_row) in zip(line_records, edited.iterrows()):
                                 merged = dict(original)
                                 merged.update({c: edit_row[c] for c in editable})
@@ -378,20 +402,53 @@ else:
                                     'po_number': original.get('po_number'),
                                     'source_order_index': original.get('source_order_index'),
                                     'line_number': original.get('line_number')}
-                                for field, before, after in diff_editable_fields(original, merged):
+                                for field, before, after in diff_editable_fields(original, merged, EDITABLE_FIELDS):
                                     decision_events.append({**base, 'action': 'EDIT', 'field_name': field,
+                                        'before_value': before, 'after_value': after, 'reason': reason})
+                                    if field == 'material_id':
+                                        xref_fixes.append((original, before, after))
+                                for field, before, after in diff_editable_fields(original, merged, INVENTORY_FIELDS):
+                                    decision_events.append({**base, 'action': 'INVENTORY_OVERRIDE', 'field_name': field,
                                         'before_value': before, 'after_value': after, 'reason': reason})
                                 decision_events.append({**base, 'action': 'APPROVE', 'reason': reason,
                                     'source_row_hash': row_hash(merged)})
                                 updated_rows.append(merged)
                             record_decision(updated_rows, actor, 'MANUAL', decision_events)
+                            for original, before, after in xref_fixes:
+                                record_xref_correction(actor, original.get('source_doc_id'), original.get('po_number'),
+                                    original.get('channel'), original.get('item_code'), original.get('item_description'),
+                                    before or None, after, reason)
                             st.session_state.approved = load_approved()
+                            overrides.clear()
                             st.success(f'Approved by {actor}.')
                             st.rerun()
                         except StaleGoldError as exc:
                             st.error(str(exc))
                         except Exception as exc:
                             st.error('Approval failed.')
+                            st.code(str(exc))
+
+                with st.form(key=f'reject_form_{tab_key}_{index}'):
+                    reject_reason = st.text_input('Reason for rejection', key=f'reject_reason_{tab_key}_{index}',
+                        placeholder='Why this order should not proceed')
+                    rejected_submitted = st.form_submit_button('Reject order')
+                if rejected_submitted:
+                    actor = current_actor()
+                    if not actor:
+                        st.error('No authenticated reviewer identity was forwarded for this session. '
+                            'Rejection is blocked. (Use the deployed Databricks App, not a local streamlit run.)')
+                    elif not reject_reason.strip():
+                        st.error('A reason is required to reject an order.')
+                    else:
+                        try:
+                            record_decision([], actor, 'REJECT', [{'action': 'REJECT',
+                                'source_doc_id': order.source_doc_id, 'po_number': order.po_number,
+                                'source_order_index': order.source_order_index, 'reason': reject_reason}])
+                            st.session_state.rejected = load_rejections()
+                            st.success('Order rejected.')
+                            st.rerun()
+                        except Exception as exc:
+                            st.error('Rejection failed.')
                             st.code(str(exc))
 
             with st.expander('Technical details and source lineage'):

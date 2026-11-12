@@ -1,4 +1,5 @@
 """Portfolio metrics are computed from Gold, never from the answer key."""
+import difflib
 import hashlib
 import pandas as pd
 
@@ -7,6 +8,10 @@ ORDER_KEYS = ['source_doc_id', 'po_number', 'source_order_index']
 # Fields a reviewer may correct before approving. Everything else is taken as extracted.
 EDITABLE_FIELDS = ['material_id', 'quantity_each', 'expected_net_price',
     'master_customer_name', 'master_ship_to_name']
+
+# The inventory proposal is editable too, but logged as its own event type
+# (INVENTORY_OVERRIDE, not EDIT) so an override is distinguishable in the audit trail.
+INVENTORY_FIELDS = ['proposed_atp_outcome', 'proposed_ship_quantity']
 
 # Captured in the approved-orders snapshot; also the basis for detecting Gold drift.
 SNAPSHOT_FIELDS = ['source_doc_id', 'po_number', 'source_order_index', 'line_number',
@@ -78,14 +83,59 @@ def line_identifier(row):
         'item_code', 'item_description', 'quantity_as_written']
     return hashlib.sha256('|'.join(_cell(row, c) for c in basis).encode('utf-8')).hexdigest(), True
 
-def diff_editable_fields(original_row, edited_row):
-    """Field-level before/after for the fields a reviewer is allowed to correct."""
+def diff_editable_fields(original_row, edited_row, fields=EDITABLE_FIELDS):
+    """Field-level before/after for the given fields (editable fields by default,
+    or INVENTORY_FIELDS to isolate inventory overrides into their own event type)."""
     changes = []
-    for field in EDITABLE_FIELDS:
+    for field in fields:
         before, after = _cell(original_row, field), _cell(edited_row, field)
         if before != after:
             changes.append((field, before, after))
     return changes
+
+def suggest_skus(lines, line_row, limit=5):
+    """Candidate SKUs for a line the pipeline couldn't confidently match, drawn
+    from material_ids the pipeline already resolved elsewhere in this session's
+    Gold snapshot (not the full product catalog, which this app has no access
+    to) and ranked by text similarity to this line's source item code/description."""
+    resolved = lines[lines['material_id'].notna() & lines['quality_status'].ne('FAILED')]
+    catalog = (resolved[['material_id', 'item_description']].dropna(subset=['material_id'])
+        .drop_duplicates(subset=['material_id']))
+    current_material = line_row.get('material_id')
+    if pd.notna(current_material):
+        catalog = catalog[catalog['material_id'].ne(current_material)]
+    needle = ' '.join(str(line_row.get(c) or '') for c in ('item_code', 'item_description')).strip().lower()
+    if not needle or catalog.empty:
+        return []
+    scored = [(difflib.SequenceMatcher(None, needle, f'{row.material_id} {row.item_description}'.lower()).ratio(), row)
+        for row in catalog.itertuples()]
+    scored.sort(key=lambda pair: pair[0], reverse=True)
+    return [(row.material_id, row.item_description, score) for score, row in scored[:limit] if score > 0.3]
+
+def build_erp_payload(order, line_records):
+    """A mock ERP-ready sales order payload for an approved order: realistic
+    enough to show what would cross the outbound interface, not a real integration."""
+    return {
+        'order_header': {
+            'source_doc_id': order.get('source_doc_id'),
+            'po_number': order.get('po_number'),
+            'sold_to': order.get('master_customer_name') or order.get('customer'),
+            'ship_to': line_records[0].get('master_ship_to_name') if line_records else None,
+            'currency': order.get('currency'),
+            'channel': order.get('channel'),
+            'order_status': order.get('status'),
+        },
+        'order_lines': [{
+            'line_number': r.get('line_number'),
+            'material_id': r.get('material_id'),
+            'item_description': r.get('item_description'),
+            'quantity': r.get('quantity_each'),
+            'unit_price': r.get('expected_net_price'),
+            'currency': r.get('currency'),
+            'availability': r.get('proposed_atp_outcome'),
+            'ship_quantity': r.get('proposed_ship_quantity'),
+        } for r in line_records],
+    }
 
 def ready_order_lines(lines, orders):
     """Every line belonging to a READY order: the set eligible for automatic inclusion."""
