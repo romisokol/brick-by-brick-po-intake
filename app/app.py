@@ -5,7 +5,6 @@ from email.parser import BytesParser
 import pypdfium2 as pdfium
 import pandas as pd
 import streamlit as st
-import altair as alt
 from database import (load_lines, source_files, ensure_approval_tables, load_approved,
     load_rejections, record_decision, record_xref_correction, gold_rows_for_order,
     check_not_stale, StaleGoldError)
@@ -39,7 +38,7 @@ if not st.session_state.get('workspace_entered', False):
     .welcome-title{font-family:Georgia,serif;font-size:clamp(44px,6vw,78px);font-weight:400;line-height:1.06;color:#18334b;margin:0 0 26px}
     .welcome-copy{font-size:18px;line-height:1.7;color:#63717b;max-width:560px;margin-bottom:28px}
     .welcome-panel{background:#18334b;border-radius:20px;padding:48px 38px;color:#f7f5f0;margin-top:12px}
-    .welcome-monogram{font-family:Georgia,serif;font-size:72px;color:#d4bf8c;border-bottom:1px solid #61707a;padding-bottom:30px;margin-bottom:32px}
+    .welcome-monogram{font-family:Georgia,serif;font-size:32px;letter-spacing:.04em;color:#d4bf8c;border-bottom:1px solid #61707a;padding-bottom:30px;margin-bottom:32px}
     .welcome-step{font-size:18px;margin:26px 0 10px;color:#fff}
     .welcome-detail{font-size:14px;line-height:1.65;color:#c3ced6}
     div.stButton > button[kind="primary"]{background:#18334b;border:1px solid #18334b;color:white;border-radius:8px;padding:12px 28px}
@@ -48,13 +47,18 @@ if not st.session_state.get('workspace_entered', False):
     intro, spacer, panel = st.columns([1.3,.12,1])
     with intro:
         st.markdown('<div class="welcome-kicker">ORDER OPERATIONS WORKSPACE</div><div class="welcome-title">Every order.<br>A clearer picture.</div><div class="welcome-copy">From incoming purchase orders to informed decisions. Explore your order book, focus on exceptions, and review every detail alongside its source.</div>', unsafe_allow_html=True)
+        access_code = st.text_input('Workspace access code', type='password', key='access_code',
+            placeholder='Enter your access code', label_visibility='collapsed')
         if st.button('Enter workspace →', type='primary', key='enter_workspace'):
-            st.session_state.workspace_entered = True
-            st.rerun()
+            if access_code:
+                st.session_state.workspace_entered = True
+                st.rerun()
+            else:
+                st.error('Enter your access code to continue.')
         st.caption('Access authenticated by Databricks')
         st.caption('Live workspace tables · Synthetic project documents · Read-only preview')
     with panel:
-        st.markdown('<div class="welcome-panel"><div class="welcome-monogram">MS</div><div class="welcome-step">01 &nbsp; See the whole picture</div><div class="welcome-detail">Order activity and quality, in one overview.</div><div class="welcome-step">02 &nbsp; Focus your attention</div><div class="welcome-detail">Find orders requiring review and understand why.</div><div class="welcome-step">03 &nbsp; Follow the evidence</div><div class="welcome-detail">Compare extracted details with the original document.</div></div>', unsafe_allow_html=True)
+        st.markdown('<div class="welcome-panel"><div class="welcome-monogram">Maison Solenne</div><div class="welcome-step">01 &nbsp; Focus your attention</div><div class="welcome-detail">Find orders requiring review and understand why.</div><div class="welcome-step">02 &nbsp; Follow the evidence</div><div class="welcome-detail">Compare extracted details with the original document.</div></div>', unsafe_allow_html=True)
     st.stop()
 
 def status_row_style(row):
@@ -146,13 +150,12 @@ def render_source(data, extension, key):
             st.info('Download the original file to view this format.')
 
 
-COLORS = {'READY':'#5B9476', 'REVIEW':'#C49A45', 'FAILED':'#BE6670'}
 st.sidebar.title('MAISON SOLENNE')
 st.sidebar.caption('ORDER OPERATIONS')
 if st.sidebar.button('← Welcome', key='return_to_welcome'):
     st.session_state.workspace_entered = False
     st.rerun()
-page = st.sidebar.radio('Workspace', ['Overview', 'Review queue', 'Order review'])
+page = st.sidebar.radio('Workspace', ['Review queue', 'Order review'])
 st.sidebar.caption('Live Databricks data · View only')
 if st.sidebar.button('Refresh data'):
     for key in ['gold_lines', 'approved', 'rejected', 'approvals_ready', 'approvals_error', 'auto_included']:
@@ -226,34 +229,7 @@ if st.session_state.approvals_ready and not st.session_state.get('auto_included'
             st.code(str(exc))
     st.session_state.auto_included = True
 
-if page == 'Overview':
-    cols = st.columns(4)
-    cols[0].metric('Proposed orders', f'{len(orders):,}')
-    cols[1].metric('Order lines', f'{len(lines):,}')
-    cols[2].metric('Needs attention', f'{orders.status.ne("READY").sum():,}')
-    cols[3].metric('Ready order share', f'{orders.status.eq("READY").mean():.1%}')
-    st.caption('Ready share is a routing metric, not measured straight-through processing or accuracy.')
-    left, right = st.columns(2)
-    with left:
-        st.subheader('Line quality')
-        counts = lines.groupby('quality_status').size().reset_index(name='lines')
-        st.altair_chart(alt.Chart(counts).mark_arc(innerRadius=65).encode(theta='lines:Q', color=alt.Color('quality_status:N', scale=alt.Scale(domain=list(COLORS), range=list(COLORS.values()))), tooltip=['quality_status','lines']).properties(height=300), use_container_width=True)
-    with right:
-        st.subheader('Lines by channel')
-        counts = lines.groupby('channel').size().reset_index(name='lines')
-        st.altair_chart(alt.Chart(counts).mark_bar(color='#527FA3').encode(x='lines:Q',y=alt.Y('channel:N',sort='-x', title=None, axis=alt.Axis(labelLimit=220)),tooltip=['channel','lines']).properties(height=300), use_container_width=True)
-    left, right = st.columns(2)
-    with left:
-        st.subheader('Reasons for review')
-        reasons = lines.loc[lines.needs_review.fillna(True), 'review_reasons'].dropna().str.split('; ').explode()
-        counts = reasons[reasons.ne('')].value_counts().head(8).rename_axis('reason').reset_index(name='lines')
-        st.altair_chart(alt.Chart(counts).mark_bar(color='#527FA3').encode(x='lines:Q', y=alt.Y('reason:N',sort='-x', title=None, axis=alt.Axis(labelLimit=280)), tooltip=['reason','lines']).properties(height=300),use_container_width=True)
-    with right:
-        st.subheader('Inventory proposals')
-        counts = lines.groupby('proposed_atp_outcome').size().reset_index(name='lines')
-        st.altair_chart(alt.Chart(counts).mark_bar(color='#527FA3').encode(x=alt.X('proposed_atp_outcome:N', title='Availability proposal', axis=alt.Axis(labelAngle=0)), y='lines:Q',tooltip=['proposed_atp_outcome','lines']).properties(height=300),use_container_width=True)
-
-elif page == 'Review queue':
+if page == 'Review queue':
     st.caption('Prioritized by missing or low confidence, then by currency and known order value.')
     statuses = st.multiselect('Order status', ['FAILED','REVIEW','READY'], default=['FAILED','REVIEW'])
     queue = orders[orders.status.isin(statuses)].copy()

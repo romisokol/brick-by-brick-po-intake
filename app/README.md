@@ -1,6 +1,6 @@
 # Maison Solenne review app
 
-A Streamlit app for the Gold schema exported November 5. Includes an overview, order-level risk queue, original-document evidence next to proposed order lines, and an approval workflow. No pipeline source is moved, replaced, or executed, and Gold, Silver, Bronze, and reference data are never written to directly.
+A Streamlit app for the Gold schema exported November 5. Includes an order-level risk queue, original-document evidence next to proposed order lines, and an approval workflow. No pipeline source is moved, replaced, or executed, and Gold, Silver, Bronze, and reference data are never written to directly.
 
 Approvals write only to three new, app-owned tables: `gold.approved_sales_orders` (a snapshot of approved/auto-included lines, upserted by a durable `gold_line_id`), `gold.review_events` (an append-only audit log of every edit, inventory override, approve/auto-approve, and reject decision, with who, when, before → after, and the reason), and `gold.xref_corrections` (an append-only log of reviewer-confirmed item-code → SKU corrections, for a pipeline engineer to merge into `retailer_item_xref` by hand). See "Approval workflow" below.
 
