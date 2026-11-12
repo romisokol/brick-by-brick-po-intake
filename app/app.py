@@ -6,8 +6,8 @@ import pypdfium2 as pdfium
 import pandas as pd
 import streamlit as st
 from database import (load_lines, source_files, ensure_approval_tables, load_approved,
-    load_rejections, record_decision, record_xref_correction, gold_rows_for_order,
-    check_not_stale, StaleGoldError)
+    load_rejections, record_decision, record_xref_correction, reset_demo_data,
+    gold_rows_for_order, check_not_stale, StaleGoldError)
 from logic import (orders_from_lines, select_order, ready_order_lines, line_identifier,
     row_hash, diff_editable_fields, suggest_skus, build_erp_payload, review_status,
     filtered_reasons, EDITABLE_FIELDS, INVENTORY_FIELDS)
@@ -233,6 +233,21 @@ orders['review_status'] = review_status(orders, st.session_state.get('approved')
 show_handled = st.sidebar.checkbox('Show approved/rejected orders in queues', value=False)
 st.sidebar.caption('Approving or rejecting an order moves it out of the active queue below, '
     'since neither writes back to Gold\'s own status -- this filter is computed here in the app.')
+
+with st.sidebar.expander('⚠️ Reset demo data'):
+    st.caption('Permanently deletes every approval, rejection, and xref correction '
+        'logged so far. Does not touch Gold. Cannot be undone.')
+    confirm_text = st.text_input('Type RESET to enable', key='reset_demo_confirm')
+    if st.button('Reset all approvals/rejections', disabled=(confirm_text != 'RESET'), key='reset_demo_button'):
+        try:
+            reset_demo_data()
+            for key in ['approved', 'rejected', 'approvals_ready', 'approvals_error', 'auto_included']:
+                st.session_state.pop(key, None)
+            st.success('Demo data reset.')
+            st.rerun()
+        except Exception as exc:
+            st.error('Reset failed.')
+            st.code(str(exc))
 
 if page == 'Review queue':
     st.caption('Prioritized by missing or low confidence, then by currency and known order value.')

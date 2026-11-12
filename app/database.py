@@ -1,7 +1,7 @@
 """Gold, Silver, and Bronze business tables are read-only here -- never
-updated, never written to directly. Writes are limited to two app-owned
-approvals tables (see ensure_approval_tables below): an approved-orders
-snapshot and an append-only review-events audit log."""
+updated, never written to directly. Writes are limited to three app-owned
+tables (see ensure_approval_tables below): an approved-orders snapshot, an
+append-only review-events audit log, and an xref-corrections feed."""
 import os
 import uuid
 from contextlib import contextmanager
@@ -130,6 +130,15 @@ def load_rejections():
                 PARTITION BY source_doc_id, po_number, source_order_index
                 ORDER BY event_time DESC) AS rn
             FROM {REVIEW_EVENTS} WHERE action = 'REJECT') WHERE rn = 1''')
+
+def reset_demo_data():
+    """Permanently deletes every approval, rejection, and xref correction
+    logged so far. Never touches Gold. For deliberate, manual use only (a
+    demo/testing reset) -- ordinary refresh and redeploy never call this."""
+    with connection() as conn, conn.cursor() as cursor:
+        cursor.execute(f'DELETE FROM {APPROVED_ORDERS}')
+        cursor.execute(f'DELETE FROM {REVIEW_EVENTS}')
+        cursor.execute(f'DELETE FROM {XREF_CORRECTIONS}')
 
 def record_xref_correction(actor, source_doc_id, po_number, channel, retailer_item_id,
         item_description, previous_material_id, confirmed_material_id, reason):
