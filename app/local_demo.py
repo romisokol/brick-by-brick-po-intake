@@ -31,18 +31,23 @@ def load_local_lines():
     manifest = pd.read_csv(DATA_ROOT / "ground_truth" / "manifest.csv")
     raw = pd.read_csv(DATA_ROOT / "ground_truth" / "lines.csv").iloc[:-2].copy()
 
-    # One document may contain multiple POs, so these are review cases.
-    groups = raw.groupby(["doc_id", "po_number"], dropna=False).size().reset_index(name="count")
+    # One document may contain multiple POs, so these are review cases. Use a
+    # stable string for blank PO numbers: NaN equality/hash behavior differs
+    # across pandas runtimes and previously moved 14 lines between statuses in
+    # Databricks even though the same fixture was correct locally.
+    raw["_demo_po_key"] = raw["po_number"].fillna("__MISSING_PO__").astype(str)
+    groups = raw.groupby(["doc_id", "_demo_po_key"]).size().reset_index(name="count")
     failed_indexes = _subset_sum(groups["count"].tolist(), 80)
     ready_indexes = _subset_sum(groups["count"].tolist(), 1637, frozenset(failed_indexes))
-    failed_keys = set(map(tuple, groups.loc[failed_indexes, ["doc_id", "po_number"]].to_records(index=False)))
-    ready_keys = set(map(tuple, groups.loc[ready_indexes, ["doc_id", "po_number"]].to_records(index=False)))
+    failed_keys = set(map(tuple, groups.loc[failed_indexes, ["doc_id", "_demo_po_key"]].to_records(index=False)))
+    ready_keys = set(map(tuple, groups.loc[ready_indexes, ["doc_id", "_demo_po_key"]].to_records(index=False)))
 
     def status_for(row):
-        key = (row.doc_id, row.po_number)
+        key = (row.doc_id, row._demo_po_key)
         return "FAILED" if key in failed_keys else "READY" if key in ready_keys else "REVIEW"
 
     raw["quality_status"] = raw.apply(status_for, axis=1)
+    raw.drop(columns=["_demo_po_key"], inplace=True)
 
     # Stable presentation cases for the live demo. The underlying
     # quality_status stays unchanged so the portfolio still reconciles to

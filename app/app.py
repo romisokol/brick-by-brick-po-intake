@@ -200,8 +200,6 @@ if lines.empty:
     st.stop()
 orders = orders_from_lines(lines)
 metrics = portfolio_metrics(lines)
-if is_local_demo():
-    st.sidebar.caption('Local demo · repository ground truth')
 st.caption('Proposed sales orders · quantities in individual units · values in original currencies')
 
 if 'approvals_ready' not in st.session_state:

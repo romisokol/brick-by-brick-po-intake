@@ -18,6 +18,15 @@ class LocalDemoTests(unittest.TestCase):
         self.assertEqual(counts, {"READY": 1637, "REVIEW": 1000, "FAILED": 80})
         self.assertAlmostEqual(counts["READY"] / len(lines) * 100, 60.3, places=1)
 
+    def test_blank_po_rows_receive_deterministic_statuses(self):
+        first = load_local_lines()
+        second = load_local_lines()
+        first = first[first.po_number.isna()][["source_doc_id", "line_number", "quality_status"]]
+        second = second[second.po_number.isna()][["source_doc_id", "line_number", "quality_status"]]
+
+        self.assertFalse(first.empty)
+        self.assertEqual(first.to_dict("records"), second.to_dict("records"))
+
     def test_curated_walkthrough_cases_are_stable(self):
         lines = load_local_lines()
         cases = {
