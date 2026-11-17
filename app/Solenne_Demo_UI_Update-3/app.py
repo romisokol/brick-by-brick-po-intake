@@ -39,7 +39,6 @@ if not st.session_state.get('workspace_entered', False):
             st.session_state.workspace_entered = True
             st.rerun()
         st.caption('Access authenticated by Databricks')
-        st.caption('Live workspace tables · Synthetic project documents · Read-only preview')
     with panel:
         st.markdown('<div class="welcome-panel"><div class="welcome-monogram">MS</div><div class="welcome-step">01 &nbsp; See the whole picture</div><div class="welcome-detail">Order activity and quality, in one overview.</div><div class="welcome-step">02 &nbsp; Focus your attention</div><div class="welcome-detail">Find orders requiring review and understand why.</div><div class="welcome-step">03 &nbsp; Follow the evidence</div><div class="welcome-detail">Compare extracted details with the original document.</div></div>', unsafe_allow_html=True)
     st.stop()

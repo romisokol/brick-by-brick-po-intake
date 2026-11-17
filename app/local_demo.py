@@ -92,6 +92,34 @@ def load_local_lines():
     raw["proposed_atp_outcome"] = raw["expected_atp_outcome"]
     raw["proposed_ship_quantity"] = raw["expected_ship_qty"]
     raw["source_pointer"] = raw.apply(lambda row: f"{row.relative_path}, line {row.line_no}", axis=1)
+
+    # Leave a small number of problem fields genuinely blank in the curated
+    # walkthroughs.  The source values remain visible in the original document,
+    # so the reviewer has a concrete correction to make in the approval editor.
+    # These presentation-only gaps do not alter quality_status or portfolio KPIs.
+    curated_blanks = {
+        ("DOC-00099", "ANT/PO/26/0736"): {
+            5: ("material_id",),
+            7: ("expected_net_price",),
+            9: ("quantity_each",),
+            11: ("master_ship_to_name",),
+        },
+        ("DOC-00008", "4593430858"): {
+            1: ("material_id",),
+            2: ("expected_net_price",),
+            3: ("quantity_each",),
+            4: ("master_ship_to_name",),
+            7: ("material_id", "expected_net_price"),
+            8: ("quantity_each",),
+        },
+    }
+    for (doc_id, po_number), line_gaps in curated_blanks.items():
+        order_mask = raw["doc_id"].eq(doc_id) & raw["po_number"].astype(str).eq(po_number)
+        for line_number, fields in line_gaps.items():
+            line_mask = order_mask & raw["line_number"].eq(line_number)
+            for field in fields:
+                raw.loc[line_mask, field] = None
+
     raw["review_reasons"] = raw["display_quality_status"].map({
         "READY": "",
         "REVIEW": "Ship-to unresolved; Document price differs from contract price",
