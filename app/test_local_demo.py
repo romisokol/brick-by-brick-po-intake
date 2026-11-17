@@ -41,6 +41,22 @@ class LocalDemoTests(unittest.TestCase):
             self.assertFalse(selected.empty)
             self.assertEqual(set(selected.display_quality_status), expected)
 
+    def test_curated_attention_cases_have_fields_to_correct(self):
+        lines = load_local_lines()
+        editable = ["material_id", "quantity_each", "expected_net_price", "master_ship_to_name"]
+        for doc_id, po_number in [
+            ("DOC-00099", "ANT/PO/26/0736"),
+            ("DOC-00008", "4593430858"),
+        ]:
+            selected = lines[
+                lines.source_doc_id.eq(doc_id) & lines.po_number.astype(str).eq(po_number)
+            ]
+            attention = selected[selected.display_quality_status.isin(["REVIEW", "FAILED"])]
+
+            self.assertFalse(attention.empty)
+            self.assertTrue(attention[editable].isna().any(axis=1).any())
+            self.assertTrue(attention[editable].notna().any(axis=1).all())
+
     def test_local_approval_is_separate_from_source_rows(self):
         source = load_local_lines()
         ready = source[source["quality_status"].eq("READY")].iloc[:2]

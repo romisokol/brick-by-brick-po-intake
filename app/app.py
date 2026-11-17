@@ -60,7 +60,6 @@ if not st.session_state.get('workspace_entered', False):
             else:
                 st.error('Enter your access code to continue.')
         st.caption('Access authenticated by Databricks')
-        st.caption('Live workspace tables · Synthetic project documents · Read-only preview')
     with panel:
         st.markdown('<div class="welcome-panel"><div class="welcome-monogram">Maison Solenne</div><div class="welcome-step">01 &nbsp; Focus your attention</div><div class="welcome-detail">Find orders requiring review and understand why.</div><div class="welcome-step">02 &nbsp; Follow the evidence</div><div class="welcome-detail">Compare extracted details with the original document.</div></div>', unsafe_allow_html=True)
     st.stop()
